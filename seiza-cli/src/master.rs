@@ -2,9 +2,9 @@ use crate::provenance::{FileIdentity, file_identity, validate_path_roles, write_
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use seiza_stacking::{
-    FitsFrame, FlatStarMaskingOptions, FlatStarMaskingStatistics, MasterBuildOptions, MasterDark,
-    MasterFrame, MasterFrameKind, MasterRejectionMethod, MasterRejectionOptions,
-    build_master_from_fits, write_master_fits_f32,
+    FitsFrame, FlatStarMaskingOptions, FlatStarMaskingStatistics, MasterBuildOptions,
+    MasterBuildStage, MasterDark, MasterFrame, MasterFrameKind, MasterProgress,
+    MasterRejectionMethod, MasterRejectionOptions, build_master_from_fits, write_master_fits_f32,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -259,6 +259,7 @@ fn build(
         bias,
         dark,
         cancel: None,
+        progress: Some(print_progress()),
         defect_suppression: None,
         flat_star_masking,
         dark_level_screening: None,
@@ -412,4 +413,38 @@ fn load_bias(path: &Path) -> Result<FitsFrame> {
     let frame = crate::common::open_frame(path, "master bias")?;
     frame.validate_master_kind("BIAS")?;
     Ok(frame)
+}
+
+/// Build progress on stderr. On a terminal one line per stage counts up in
+/// place; in a pipe or log each stage writes one line when it ends, so the
+/// log is not filled with carriage returns.
+fn print_progress() -> MasterProgress {
+    use std::io::IsTerminal;
+    let terminal = std::io::stderr().is_terminal();
+    MasterProgress::new(move |progress| {
+        let what = match progress.stage {
+            MasterBuildStage::Read => "reading",
+            MasterBuildStage::Reread => "rereading kept darks",
+            MasterBuildStage::Integrate => "integrating",
+            MasterBuildStage::Combine => "combining tiles",
+        };
+        let unit = if progress.stage == MasterBuildStage::Combine {
+            "tile"
+        } else {
+            "frame"
+        };
+        if progress.done < progress.total {
+            if terminal {
+                eprint!(
+                    "\r{what}: {unit} {}/{}   ",
+                    progress.done + 1,
+                    progress.total
+                );
+            }
+        } else if terminal {
+            eprintln!("\r{what}: {} {unit}(s) done   ", progress.total);
+        } else {
+            eprintln!("{what}: {} {unit}(s) done", progress.total);
+        }
+    })
 }
