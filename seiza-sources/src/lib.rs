@@ -17,7 +17,50 @@ const CDS_TYCHO2: &str = "https://cdsarc.cds.unistra.fr/ftp/I/259";
 const OPENNGC: &str = "https://raw.githubusercontent.com/mattiaverga/OpenNGC/master/database_files";
 const OPENNGC_ARCHIVE: &str =
     "https://github.com/mattiaverga/OpenNGC/archive/refs/heads/master.tar.gz";
-const GAIA_TAP_SYNC: &str = "https://gea.esac.esa.int/tap-server/tap/sync";
+/// A TAP service carrying Gaia DR3 under the archive's column names.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GaiaArchive {
+    /// ESA's Gaia archive (`gaiadr3.gaia_source`), the primary source.
+    #[default]
+    Esa,
+    /// The GAVO data centre's mirror in Heidelberg (`gaia.dr3lite`), which
+    /// carries every column Seiza reads.
+    Gavo,
+}
+
+impl GaiaArchive {
+    fn sync_url(self) -> &'static str {
+        match self {
+            Self::Esa => "https://gea.esac.esa.int/tap-server/tap/sync",
+            Self::Gavo => "https://dc.g-vo.org/tap/sync",
+        }
+    }
+
+    fn async_url(self) -> &'static str {
+        match self {
+            Self::Esa => "https://gea.esac.esa.int/tap-server/tap/async",
+            Self::Gavo => "https://dc.g-vo.org/tap/async",
+        }
+    }
+
+    fn table(self) -> &'static str {
+        match self {
+            Self::Esa => "gaiadr3.gaia_source",
+            Self::Gavo => "gaia.dr3lite",
+        }
+    }
+
+    /// How many source_id ranges each bulk chunk is fetched in. GAVO stops a
+    /// synchronous query after about 25 s, which a whole chunk near the
+    /// galactic plane exceeds.
+    fn chunk_pieces(self) -> u64 {
+        match self {
+            Self::Esa => 1,
+            Self::Gavo => 32,
+        }
+    }
+}
+const GAIA_JOB_TIMEOUT: Duration = Duration::from_secs(900);
 /// Gaia DR3 source_id encodes the HEALPix level-12 cell in the high bits.
 const GAIA_SOURCE_ID_MAX: u64 = 201_326_592 << 35;
 const GAIA_MAXREC: u64 = 3_000_000;
@@ -50,6 +93,14 @@ pub enum Error {
 
     #[error("Gaia TAP chunk response was malformed or truncated")]
     MalformedGaiaChunk,
+
+    #[error(
+        "Gaia cone search needs a finite centre, a radius in (0, 90] degrees, and a finite magnitude limit"
+    )]
+    InvalidGaiaCone,
+
+    #[error("Gaia archive query {0}")]
+    GaiaJobFailed(String),
 
     #[error("Gaia magnitude limit must be finite; got {0}")]
     InvalidGaiaMagnitude(f32),
@@ -110,6 +161,87 @@ pub enum SourceEvent {
 }
 
 type Reporter = Arc<dyn Fn(SourceEvent) + Send + Sync>;
+
+/// The most stars a Gaia cone search returns, brightest first.
+pub const GAIA_CONE_MAXREC: u64 = 200_000;
+
+/// One Gaia DR3 source from [`SourceDownloader::gaia_photometry_cone`]:
+/// its ICRS position at epoch J2016.0, proper motion, and mean photometry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GaiaPhotometry {
+    /// Right ascension, degrees.
+    pub ra: f64,
+    /// Declination, degrees.
+    pub dec: f64,
+    /// Proper motion in right ascension times cos(dec), mas/yr.
+    pub pmra: Option<f64>,
+    /// Proper motion in declination, mas/yr.
+    pub pmdec: Option<f64>,
+    /// G-band mean magnitude.
+    pub g: f32,
+    /// BP mean magnitude.
+    pub bp: Option<f32>,
+    /// RP mean magnitude.
+    pub rp: Option<f32>,
+    /// Renormalized unit weight error; above about 1.4 the source is likely
+    /// a binary or otherwise poorly fitted.
+    pub ruwe: Option<f32>,
+}
+
+impl GaiaPhotometry {
+    /// The BP − RP colour, when both magnitudes are measured.
+    pub fn bp_rp(&self) -> Option<f32> {
+        Some(self.bp? - self.rp?)
+    }
+}
+
+/// Parse the CSV [`SourceDownloader::gaia_photometry_cone_csv`] returns.
+/// Rows with a missing position or G magnitude are skipped.
+pub fn parse_gaia_photometry(csv: &str) -> Result<Vec<GaiaPhotometry>> {
+    let mut lines = csv.lines();
+    let header = lines.next().ok_or(Error::MalformedGaiaChunk)?;
+    let columns = header.split(',').map(str::trim).collect::<Vec<_>>();
+    let column = |name: &str| {
+        columns
+            .iter()
+            .position(|column| *column == name)
+            .ok_or(Error::MalformedGaiaChunk)
+    };
+    let indices = [
+        column("ra")?,
+        column("dec")?,
+        column("pmra")?,
+        column("pmdec")?,
+        column("phot_g_mean_mag")?,
+        column("phot_bp_mean_mag")?,
+        column("phot_rp_mean_mag")?,
+        column("ruwe")?,
+    ];
+    let mut stars = Vec::new();
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        let fields = line.split(',').map(str::trim).collect::<Vec<_>>();
+        let value = |index: usize| {
+            fields
+                .get(indices[index])
+                .and_then(|field| field.parse::<f64>().ok())
+                .filter(|value| value.is_finite())
+        };
+        let (Some(ra), Some(dec), Some(g)) = (value(0), value(1), value(4)) else {
+            continue;
+        };
+        stars.push(GaiaPhotometry {
+            ra,
+            dec,
+            pmra: value(2),
+            pmdec: value(3),
+            g: g as f32,
+            bp: value(5).map(|value| value as f32),
+            rp: value(6).map(|value| value as f32),
+            ruwe: value(7).map(|value| value as f32),
+        });
+    }
+    Ok(stars)
+}
 
 /// Reusable asynchronous client for upstream astronomy sources.
 #[derive(Clone)]
@@ -403,6 +535,49 @@ impl SourceDownloader {
         max_mag: f32,
         chunks: u64,
     ) -> Result<()> {
+        self.download_gaia_columns(
+            output.as_ref(),
+            max_mag,
+            chunks,
+            "gaia-",
+            "ra, dec, pmra, pmdec, phot_g_mean_mag",
+            GaiaArchive::Esa,
+        )
+        .await
+    }
+
+    /// [`Self::download_gaia`] with BP and RP photometry and RUWE, for a
+    /// colour-calibration catalogue: chunks `gaiaphot-NNNN.csv` with columns
+    /// ra, dec, pmra, pmdec, phot_g_mean_mag, phot_bp_mean_mag,
+    /// phot_rp_mean_mag and ruwe. Completed chunks are kept, so an
+    /// interrupted download resumes, from either archive.
+    pub async fn download_gaia_photometry(
+        &self,
+        output: impl AsRef<Path>,
+        max_mag: f32,
+        chunks: u64,
+        archive: GaiaArchive,
+    ) -> Result<()> {
+        self.download_gaia_columns(
+            output.as_ref(),
+            max_mag,
+            chunks,
+            "gaiaphot-",
+            "ra, dec, pmra, pmdec, phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag, ruwe",
+            archive,
+        )
+        .await
+    }
+
+    async fn download_gaia_columns(
+        &self,
+        output: &Path,
+        max_mag: f32,
+        chunks: u64,
+        prefix: &str,
+        columns: &str,
+        archive: GaiaArchive,
+    ) -> Result<()> {
         if !max_mag.is_finite() {
             return Err(Error::InvalidGaiaMagnitude(max_mag));
         }
@@ -413,12 +588,11 @@ impl SourceDownloader {
             });
         }
 
-        let output = output.as_ref();
         create_dir_all(output).await?;
         let mut completed = 0u64;
 
         for chunk in 0..chunks {
-            let target = output.join(format!("gaia-{chunk:04}.csv"));
+            let target = output.join(format!("{prefix}{chunk:04}.csv"));
             if chunk_complete(&target).await? {
                 completed += 1;
                 continue;
@@ -429,48 +603,98 @@ impl SourceDownloader {
             } else {
                 GAIA_SOURCE_ID_MAX / chunks * (chunk + 1) - 1
             };
-            let query = format!(
-                "SELECT ra, dec, pmra, pmdec, phot_g_mean_mag FROM gaiadr3.gaia_source \
-                 WHERE phot_g_mean_mag <= {max_mag} AND source_id BETWEEN {lo} AND {hi}"
-            );
-
-            let mut attempts = 0u32;
-            loop {
-                attempts += 1;
-                match self.fetch_gaia_chunk(&query, &target).await {
-                    Ok(rows) => {
-                        if rows >= GAIA_MAXREC {
-                            return Err(Error::GaiaRowCap {
-                                chunk,
-                                limit: GAIA_MAXREC,
-                                suggested_chunks: chunks.saturating_mul(4).min(GAIA_SOURCE_ID_MAX),
-                            });
-                        }
-                        completed += 1;
-                        (self.reporter)(SourceEvent::GaiaChunkComplete {
-                            chunk,
-                            rows,
-                            completed,
-                            total: chunks,
-                        });
-                        break;
-                    }
-                    Err(error) if attempts < 4 => {
-                        let delay = Duration::from_secs(5 * attempts as u64);
-                        (self.reporter)(SourceEvent::Retry {
-                            label: format!("Gaia chunk {chunk:04}"),
-                            attempt: attempts,
-                            delay,
-                            error: error.to_string(),
-                        });
-                        tokio::time::sleep(delay).await;
-                    }
-                    Err(error) => return Err(error),
+            let pieces = archive.chunk_pieces().min(hi - lo + 1);
+            let mut rows = 0u64;
+            let mut piece_paths = Vec::new();
+            for piece in 0..pieces {
+                let span = (hi - lo + 1) / pieces;
+                let piece_lo = lo + span * piece;
+                let piece_hi = if piece + 1 == pieces {
+                    hi
+                } else {
+                    piece_lo + span - 1
+                };
+                let piece_target = if pieces == 1 {
+                    target.clone()
+                } else {
+                    piece_path(&target, piece)
+                };
+                piece_paths.push(piece_target.clone());
+                rows += self
+                    .fetch_gaia_range(
+                        columns,
+                        max_mag,
+                        (piece_lo, piece_hi),
+                        &piece_target,
+                        archive,
+                        &format!("Gaia chunk {chunk:04}"),
+                    )
+                    .await?;
+            }
+            if pieces > 1 {
+                join_gaia_pieces(&piece_paths, &target).await?;
+            } else {
+                // Another archive may have left pieces of this chunk behind.
+                for piece in 0..GaiaArchive::Gavo.chunk_pieces() {
+                    let _ = tokio::fs::remove_file(piece_path(&target, piece)).await;
                 }
             }
+            if rows >= GAIA_MAXREC {
+                return Err(Error::GaiaRowCap {
+                    chunk,
+                    limit: GAIA_MAXREC,
+                    suggested_chunks: chunks.saturating_mul(4).min(GAIA_SOURCE_ID_MAX),
+                });
+            }
+            completed += 1;
+            (self.reporter)(SourceEvent::GaiaChunkComplete {
+                chunk,
+                rows,
+                completed,
+                total: chunks,
+            });
         }
         self.ready("Gaia", output);
         Ok(())
+    }
+
+    /// Fetch one source_id range into `target`, retrying, unless an earlier
+    /// run already finished it. Returns the row count.
+    async fn fetch_gaia_range(
+        &self,
+        columns: &str,
+        max_mag: f32,
+        (lo, hi): (u64, u64),
+        target: &Path,
+        archive: GaiaArchive,
+        label: &str,
+    ) -> Result<u64> {
+        if chunk_complete(target).await? {
+            return count_rows(target).await;
+        }
+        let query = format!(
+            "SELECT {columns} FROM {table} \
+             WHERE phot_g_mean_mag <= {max_mag} AND source_id BETWEEN {lo} AND {hi}",
+            table = archive.table()
+        );
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            match self.fetch_gaia_chunk(&query, target, archive).await {
+                Ok(rows) => return Ok(rows),
+                Err(error) if attempts < 4 => {
+                    let delay = Duration::from_secs(5 * attempts as u64);
+                    (self.reporter)(SourceEvent::Retry {
+                        label: label.to_owned(),
+                        attempt: attempts,
+                        delay,
+                        error: error.to_string(),
+                    });
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Minor Planet Center comet/asteroid elements plus JPL SBDB historical
@@ -597,7 +821,216 @@ impl SourceDownloader {
         transfer
     }
 
-    async fn fetch_gaia_chunk(&self, query: &str, target: &Path) -> Result<u64> {
+    /// Gaia DR3 sources within `radius_deg` of `(ra, dec)` down to G
+    /// `max_mag`, brightest first, with their BP and RP photometry, from the
+    /// ESA Gaia archive. A field holding [`GAIA_CONE_MAXREC`] stars or more
+    /// is refused rather than cut short: use a brighter limit.
+    pub async fn gaia_photometry_cone(
+        &self,
+        ra: f64,
+        dec: f64,
+        radius_deg: f64,
+        max_mag: f32,
+    ) -> Result<Vec<GaiaPhotometry>> {
+        parse_gaia_photometry(
+            &self
+                .gaia_photometry_cone_csv(ra, dec, radius_deg, max_mag)
+                .await?,
+        )
+    }
+
+    /// [`Self::gaia_photometry_cone`] as the archive's CSV, for a caller
+    /// that caches it; [`parse_gaia_photometry`] reads it.
+    /// ESA's archive answers first; when it fails, GAVO's mirror does.
+    pub async fn gaia_photometry_cone_csv(
+        &self,
+        ra: f64,
+        dec: f64,
+        radius_deg: f64,
+        max_mag: f32,
+    ) -> Result<String> {
+        match self
+            .gaia_photometry_cone_csv_from(GaiaArchive::Esa, ra, dec, radius_deg, max_mag)
+            .await
+        {
+            Ok(csv) => Ok(csv),
+            Err(esa) => {
+                (self.reporter)(SourceEvent::Retry {
+                    label: "Gaia cone search on the GAVO mirror".into(),
+                    attempt: 1,
+                    delay: Duration::ZERO,
+                    error: esa.to_string(),
+                });
+                self.gaia_photometry_cone_csv_from(GaiaArchive::Gavo, ra, dec, radius_deg, max_mag)
+                    .await
+                    .map_err(|_| esa)
+            }
+        }
+    }
+
+    /// [`Self::gaia_photometry_cone_csv`] from one archive.
+    pub async fn gaia_photometry_cone_csv_from(
+        &self,
+        archive: GaiaArchive,
+        ra: f64,
+        dec: f64,
+        radius_deg: f64,
+        max_mag: f32,
+    ) -> Result<String> {
+        if !ra.is_finite()
+            || !dec.is_finite()
+            || !(radius_deg.is_finite() && radius_deg > 0.0 && radius_deg <= 90.0)
+            || !max_mag.is_finite()
+        {
+            return Err(Error::InvalidGaiaCone);
+        }
+        let query = format!(
+            "SELECT ra, dec, pmra, pmdec, phot_g_mean_mag, phot_bp_mean_mag, \
+             phot_rp_mean_mag, ruwe FROM {table} \
+             WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra}, {dec}, {radius_deg})) \
+             AND phot_g_mean_mag <= {max_mag} ORDER BY phot_g_mean_mag",
+            table = archive.table()
+        );
+        // A wide field holds hundreds of thousands of stars, more than the
+        // synchronous endpoint returns before it times out, so the query
+        // runs as an asynchronous job: submit, poll, then fetch.
+        let form = [
+            ("REQUEST", "doQuery".to_string()),
+            ("LANG", "ADQL".to_string()),
+            ("FORMAT", "csv".to_string()),
+            ("MAXREC", GAIA_CONE_MAXREC.to_string()),
+            ("PHASE", "RUN".to_string()),
+            ("QUERY", query),
+        ];
+        let http = |source| Error::Http {
+            url: archive.async_url().into(),
+            source,
+        };
+        let submitted = self
+            .client
+            .post(archive.async_url())
+            .form(&form)
+            .send()
+            .await
+            .map_err(http)?;
+        if !submitted.status().is_success() {
+            return Err(Error::HttpStatus {
+                url: archive.async_url().into(),
+                status: submitted.status().as_u16(),
+            });
+        }
+        // The archive answers with a redirect to the job, which the client
+        // follows: the final URL is the job's. Archives may keep jobs under
+        // another path (GAVO's are under /__system__/tap/run/async/), so the
+        // job must be on the archive's host, and somewhere other than where
+        // the query was submitted.
+        let job = submitted.url().to_string();
+        let host = |url: &str| {
+            url.split_once("://")
+                .map(|(_, rest)| rest.split('/').next().unwrap_or_default().to_owned())
+        };
+        if host(&job) != host(archive.async_url())
+            || job.trim_end_matches('/') == archive.async_url()
+        {
+            return Err(Error::GaiaJobFailed(format!(
+                "was not queued: the archive answered from {job}"
+            )));
+        }
+        let result = self.finish_gaia_job(&job).await;
+        // Finished jobs only take space on the archive; clean up either way.
+        let _ = self
+            .client
+            .post(&job)
+            .form(&[("ACTION", "DELETE")])
+            .send()
+            .await;
+        let body = result?;
+        let rows = body
+            .lines()
+            .skip(1)
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        if rows as u64 >= GAIA_CONE_MAXREC {
+            return Err(Error::GaiaJobFailed(format!(
+                "returned its {GAIA_CONE_MAXREC}-star limit; use a brighter magnitude limit"
+            )));
+        }
+        // Check it parses before a caller caches it.
+        parse_gaia_photometry(&body)?;
+        Ok(body)
+    }
+
+    /// Poll a queued TAP job until it completes, and return its result.
+    async fn finish_gaia_job(&self, job: &str) -> Result<String> {
+        let http = |source| Error::Http {
+            url: job.into(),
+            source,
+        };
+        let started = std::time::Instant::now();
+        loop {
+            let response = self
+                .client
+                .get(format!("{job}/phase"))
+                .send()
+                .await
+                .map_err(http)?;
+            if !response.status().is_success() {
+                return Err(Error::HttpStatus {
+                    url: format!("{job}/phase"),
+                    status: response.status().as_u16(),
+                });
+            }
+            let phase = response.text().await.map_err(http)?;
+            match phase.trim() {
+                "COMPLETED" => break,
+                "PENDING" | "QUEUED" | "EXECUTING" => {
+                    if started.elapsed() > GAIA_JOB_TIMEOUT {
+                        return Err(Error::GaiaJobFailed("timed out".into()));
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                "ERROR" => {
+                    let reason = match self.client.get(format!("{job}/error")).send().await {
+                        Ok(response) => response.text().await.unwrap_or_default(),
+                        Err(_) => String::new(),
+                    };
+                    let reason = reason.trim();
+                    return Err(Error::GaiaJobFailed(if reason.is_empty() {
+                        "failed".into()
+                    } else {
+                        format!("failed: {}", reason.chars().take(500).collect::<String>())
+                    }));
+                }
+                other => {
+                    return Err(Error::GaiaJobFailed(format!(
+                        "stopped in phase {}",
+                        other.chars().take(40).collect::<String>()
+                    )));
+                }
+            }
+        }
+        let response = self
+            .client
+            .get(format!("{job}/results/result"))
+            .send()
+            .await
+            .map_err(http)?;
+        if !response.status().is_success() {
+            return Err(Error::HttpStatus {
+                url: format!("{job}/results/result"),
+                status: response.status().as_u16(),
+            });
+        }
+        response.text().await.map_err(http)
+    }
+
+    async fn fetch_gaia_chunk(
+        &self,
+        query: &str,
+        target: &Path,
+        archive: GaiaArchive,
+    ) -> Result<u64> {
+        let url = archive.sync_url();
         let form = [
             ("REQUEST", "doQuery".to_string()),
             ("LANG", "ADQL".to_string()),
@@ -607,17 +1040,17 @@ impl SourceDownloader {
         ];
         let response = self
             .client
-            .post(GAIA_TAP_SYNC)
+            .post(url)
             .form(&form)
             .send()
             .await
             .map_err(|source| Error::Http {
-                url: GAIA_TAP_SYNC.into(),
+                url: url.into(),
                 source,
             })?;
         if !response.status().is_success() {
             return Err(Error::HttpStatus {
-                url: GAIA_TAP_SYNC.into(),
+                url: url.into(),
                 status: response.status().as_u16(),
             });
         }
@@ -633,7 +1066,7 @@ impl SourceDownloader {
             let mut newline_count = 0u64;
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|source| Error::Http {
-                    url: GAIA_TAP_SYNC.into(),
+                    url: url.into(),
                     source,
                 })?;
                 if prefix.len() < 6 {
@@ -816,6 +1249,59 @@ async fn verify_file(path: &Path, verify: Verify) -> Result<bool> {
     }
 }
 
+/// Where one source_id range of a chunk fetched in pieces is kept. The name
+/// does not end in `.csv`, so a catalog build never reads it.
+fn piece_path(target: &Path, piece: u64) -> PathBuf {
+    let mut name = target.as_os_str().to_owned();
+    name.push(format!(".piece{piece:02}"));
+    PathBuf::from(name)
+}
+
+/// Rows in a finished CSV chunk, not counting its header.
+async fn count_rows(path: &Path) -> Result<u64> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|source| io("read", path, source))?;
+    Ok(bytes.iter().filter(|&&byte| byte == b'\n').count() as u64 - 1)
+}
+
+/// Concatenate finished piece files under the first one's header into
+/// `target`, then remove the pieces.
+async fn join_gaia_pieces(pieces: &[PathBuf], target: &Path) -> Result<()> {
+    let temp = partial_path(target);
+    let mut output = tokio::fs::File::create(&temp)
+        .await
+        .map_err(|source| io("create", &temp, source))?;
+    for (index, piece) in pieces.iter().enumerate() {
+        let bytes = tokio::fs::read(piece)
+            .await
+            .map_err(|source| io("read", piece, source))?;
+        let body = if index == 0 {
+            &bytes[..]
+        } else {
+            let header_end = bytes
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .ok_or(Error::MalformedGaiaChunk)?;
+            &bytes[header_end + 1..]
+        };
+        output
+            .write_all(body)
+            .await
+            .map_err(|source| io("write", &temp, source))?;
+    }
+    output
+        .sync_all()
+        .await
+        .map_err(|source| io("sync", &temp, source))?;
+    drop(output);
+    replace_file(&temp, target).await?;
+    for piece in pieces {
+        let _ = tokio::fs::remove_file(piece).await;
+    }
+    Ok(())
+}
+
 async fn chunk_complete(path: &Path) -> Result<bool> {
     let mut input = match tokio::fs::File::open(path).await {
         Ok(input) => input,
@@ -878,6 +1364,20 @@ fn io(action: &'static str, path: impl Into<PathBuf>, source: std::io::Error) ->
 mod tests {
     use super::*;
 
+    #[test]
+    fn gaia_photometry_rows_parse_with_missing_colours() {
+        let csv = "ra,dec,pmra,pmdec,phot_g_mean_mag,phot_bp_mean_mag,phot_rp_mean_mag,ruwe\n\
+                   56.75,24.11,19.9,-45.5,2.86,2.84,2.89,1.1\n\
+                   56.80,24.20,,,12.5,,,\n\
+                   ,24.3,1,1,13,13,12,1\n";
+        let stars = parse_gaia_photometry(csv).unwrap();
+        assert_eq!(stars.len(), 2);
+        assert!((stars[0].bp_rp().unwrap() + 0.05).abs() < 1e-6);
+        assert_eq!(stars[1].pmra, None);
+        assert_eq!(stars[1].bp_rp(), None);
+        assert!(parse_gaia_photometry("ra,dec\n1,2\n").is_err());
+    }
+
     #[tokio::test]
     async fn gaia_completion_check_reads_only_boundaries() {
         let temp = tempfile::tempdir().unwrap();
@@ -891,6 +1391,35 @@ mod tests {
             .unwrap();
         assert!(chunk_complete(&complete).await.unwrap());
         assert!(!chunk_complete(&truncated).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn gaia_pieces_join_under_one_header() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("gaiaphot-0007.csv");
+        let pieces = [
+            (piece_path(&target, 0), &b"ra,dec\n1,2\n3,4\n"[..]),
+            (piece_path(&target, 1), &b"ra,dec\n"[..]),
+            (piece_path(&target, 2), &b"ra,dec\n5,6\n"[..]),
+        ];
+        for (path, bytes) in &pieces {
+            tokio::fs::write(path, bytes).await.unwrap();
+        }
+        assert_eq!(
+            pieces[1].0.file_name().unwrap(),
+            "gaiaphot-0007.csv.piece01"
+        );
+        let paths = pieces
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        join_gaia_pieces(&paths, &target).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(&target).await.unwrap(),
+            b"ra,dec\n1,2\n3,4\n5,6\n"
+        );
+        assert_eq!(count_rows(&target).await.unwrap(), 3);
+        assert!(paths.iter().all(|path| !path.exists()));
     }
 
     #[tokio::test]
