@@ -18,6 +18,7 @@ mod astap;
 mod background;
 mod build_data;
 mod color;
+mod color_calibrate;
 mod common;
 mod deconvolution;
 mod master;
@@ -590,6 +591,8 @@ enum Command {
     Stretch(stretch_command::StretchArgs),
     /// Estimate and remove a smooth background gradient from linear FITS
     Background(background::BackgroundArgs),
+    /// Calibrate a linear RGB image's colour against Gaia DR3 star colours
+    ColorCalibrate(color_calibrate::ColorCalibrateArgs),
     /// Experimentally restore mild blur in a linear FITS using a measured PSF
     Deconvolve(deconvolution::DeconvolutionArgs),
     /// Register and incrementally stack linear FITS light frames
@@ -794,6 +797,15 @@ enum CatalogOutputFormat {
     Csv,
 }
 
+/// A TAP service carrying Gaia DR3.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum GaiaArchiveArg {
+    /// ESA's Gaia archive
+    Esa,
+    /// The GAVO data centre's mirror
+    Gavo,
+}
+
 #[derive(Subcommand)]
 enum DownloadSource {
     /// Ready-to-use catalog bundle (recommended; SHA-256 verified)
@@ -874,6 +886,28 @@ enum DownloadSource {
             value_parser = clap::value_parser!(u64).range(1..)
         )]
         chunks: u64,
+    },
+    /// Gaia DR3 photometry (G, BP, RP, RUWE) via ESA TAP for an offline
+    /// colour-calibration catalog (resumable; can take hours)
+    GaiaPhotometry {
+        /// Directory to download into
+        #[arg(long)]
+        output: PathBuf,
+        /// Magnitude limit for the download; colour calibration uses stars
+        /// two magnitudes brighter and the rest as neighbours
+        #[arg(long, default_value_t = 15.0, allow_negative_numbers = true)]
+        max_mag: f32,
+        /// Sky chunks; deeper magnitude limits need more to stay under the
+        /// TAP row cap
+        #[arg(
+            long,
+            default_value_t = 768,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        chunks: u64,
+        /// TAP service: ESA's Gaia archive, or GAVO's Heidelberg mirror
+        #[arg(long, value_enum, default_value = "esa")]
+        archive: GaiaArchiveArg,
     },
     /// Advanced source: Rochester active supernova/transient list
     Transients {
@@ -961,6 +995,25 @@ enum BuildDataSource {
         max_mag: f32,
         /// Declination bands (tile granularity); 180 = 1° tiles
         #[arg(long, default_value_t = 180)]
+        bands: u32,
+    },
+    /// Colour-calibration catalog from Gaia DR3 photometry chunks
+    /// (download-data gaia-photometry)
+    GaiaPhotometry {
+        /// Directory containing gaiaphot-*.csv
+        #[arg(long)]
+        input: PathBuf,
+        /// Output photometry catalog file (stars-gaia-photometry.bin)
+        #[arg(long)]
+        output: PathBuf,
+        /// Epoch to apply proper motions to, Julian year
+        #[arg(long, default_value_t = 2026.0)]
+        epoch: f64,
+        /// Drop stars fainter than this magnitude
+        #[arg(long, default_value_t = 15.0)]
+        max_mag: f32,
+        /// Declination bands (tile granularity); 90 = 2° tiles
+        #[arg(long, default_value_t = 90)]
         bands: u32,
     },
     /// Transient catalog from the downloaded Rochester active list
@@ -1230,6 +1283,13 @@ fn main() -> Result<()> {
                 max_mag,
                 bands,
             } => build_data::build_gaia(&input, &output, epoch, max_mag, bands),
+            BuildDataSource::GaiaPhotometry {
+                input,
+                output,
+                epoch,
+                max_mag,
+                bands,
+            } => build_data::build_gaia_photometry(&input, &output, epoch, max_mag, bands),
             BuildDataSource::Transients { input, output } => {
                 build_data::build_transients(&input, &output)
             }
@@ -1341,6 +1401,7 @@ fn main() -> Result<()> {
         Command::FitsInfo { image, stretch } => fits_info(&image, stretch.as_deref()),
         Command::Stretch(options) => stretch_command::run(options),
         Command::Background(options) => background::run(options),
+        Command::ColorCalibrate(options) => color_calibrate::run(options),
         Command::Deconvolve(options) => deconvolution::run(options),
         Command::Stack(options) => stack::run(options),
         Command::Color(options) => color::run(options),
@@ -1487,6 +1548,20 @@ async fn download_source(source: DownloadSource) -> Result<()> {
             max_mag,
             chunks,
         } => downloader.download_gaia(output, max_mag, chunks).await,
+        DownloadSource::GaiaPhotometry {
+            output,
+            max_mag,
+            chunks,
+            archive,
+        } => {
+            let archive = match archive {
+                GaiaArchiveArg::Esa => seiza_sources::GaiaArchive::Esa,
+                GaiaArchiveArg::Gavo => seiza_sources::GaiaArchive::Gavo,
+            };
+            downloader
+                .download_gaia_photometry(output, max_mag, chunks, archive)
+                .await
+        }
         DownloadSource::Transients { output } => downloader.download_transients(output).await,
         DownloadSource::Mpc { output } => downloader.download_mpc(output).await,
         DownloadSource::Prebuilt { .. } | DownloadSource::SatelliteHistory { .. } => {
@@ -2471,7 +2546,7 @@ fn resolve_acquisition_jd(image: &std::path::Path, time: Option<&str>) -> Result
 }
 
 /// "2025-10-12T08:30:00(.frac)(Z)" to a Julian date.
-fn parse_iso_jd(text: &str) -> Option<f64> {
+pub(crate) fn parse_iso_jd(text: &str) -> Option<f64> {
     if let Ok(time) = chrono::DateTime::parse_from_rfc3339(text.trim()) {
         return Some(
             2440587.5

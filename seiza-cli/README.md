@@ -169,6 +169,63 @@ output, model, and diagnostics must be distinct paths. Raw Bayer mosaics are
 rejected because fitting the interleaved CFA colors as one channel would create
 a false surface; debayer or stack them first.
 
+## Photometric colour calibration
+
+Calibrate a linear RGB stack's colour against Gaia DR3 star colours:
+
+```
+seiza color-calibrate stack.fits --output stack-cc.fits --report colour.json
+```
+
+The image needs an astrometric solution: FITS WCS cards, which `seiza stack`
+keeps from the reference frame, or the `AstrometricSolution` properties
+PixInsight writes into XISF files. A PixInsight solution's distortion layers
+have no TAN-SIP equivalent and are left out, which moves stars near the corners
+of a distorted field by a few pixels; the photometry finds them anyway. Seiza reads Gaia DR3 photometry from an offline catalog
+when one is installed (`stars-gaia-photometry.bin` in a catalog directory, or
+`--gaia-catalog`). Otherwise it fetches the field from ESA's Gaia archive, or
+from GAVO's mirror when ESA's fails, and caches it (`--gaia-cache`); a CSV you
+supply also works (`--gaia-csv`). It measures every isolated, unsaturated Gaia star in R, G and
+B, fits each instrumental colour against Gaia BP−RP, and sets the gains that
+render a star of the white reference's colour neutral: the Sun's (BP−RP 0.82)
+unless `--white-bp-rp` says otherwise. No filter or sensor curves are needed;
+the stars measure the camera's own response. Background neutralization then
+gives the sky the same level in every channel (`--no-background-neutralization`
+leaves it).
+
+On the 126-frame M45 stack (ASI2600MC, 173 mm), about 1,670 isolated Gaia
+stars brighter than G 13 calibrated it, with 0.044 and 0.032 mag of scatter
+about the red and blue colour fits. PixInsight's SPCC, given the same image and
+a G2V white reference, chose a red gain 4.8% lower and a blue gain 3.2% higher.
+The colour model is not the cause: on the stars both tools measured, SPCC's
+filter-curve method and Seiza's BP−RP fit agree within 0.7% when given the same
+fluxes. The fluxes differ instead. For 60 isolated stars SPCC's PSF photometry
+reports R/G 0.712, while apertures from 4 to 36 px all give 0.667–0.697.
+
+The offline catalog is built from Gaia DR3 itself (CC BY-SA 3.0 IGO), not from
+PixInsight's databases. Seiza hosts a prebuilt copy (about 460 MB, downloaded zstd-compressed) that is
+not part of the standard bundle; install it with setup or by name:
+
+```
+seiza setup --preset solver-lite --gaia-photometry
+seiza download-data prebuilt --output data --file stars-gaia-photometry.bin
+```
+
+To build it yourself, `scripts/build-gaia-photometry.sh` downloads G, BP, RP
+and RUWE for every source to G 15 in 768 resumable chunks and builds the
+catalog, about 470 MB; it takes a few hours and can run unattended. Copy the
+result into Seiza's catalog directory (`$SEIZA_CATALOG_DIR`, or
+`~/.local/share/seiza/catalogs` on Linux) or pass it with `--gaia-catalog`:
+
+```
+ARCHIVE=gavo nohup scripts/build-gaia-photometry.sh ~/gaia-photometry > gaia.log 2>&1 &
+cp ~/gaia-photometry/stars-gaia-photometry.bin ~/.local/share/seiza/catalogs/
+```
+
+The two steps are also available on their own: `seiza download-data
+gaia-photometry --output chunks [--archive esa|gavo]` and `seiza build-data
+gaia-photometry --input chunks --output stars-gaia-photometry.bin`.
+
 ## Light deconvolution (experimental)
 
 `seiza deconvolve` applies a conservative damped Richardson-Lucy pass to a
@@ -449,6 +506,8 @@ seiza download-data prebuilt --output data --file objects.bin --file transients.
 # for deep blind solving.
 seiza download-data prebuilt --output data \
   --file stars-deep-gaia20.bin --file blind-gaia16.idx
+# The optional Gaia photometry catalog for colour calibration is explicit too.
+seiza download-data prebuilt --output data --file stars-gaia-photometry.bin
 ```
 
 The other `download-data` subcommands acquire upstream source material for
